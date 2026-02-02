@@ -62,9 +62,10 @@ Example:
 The Matrix (1999)
 Alien
 Blade Runner (1982)
-# Comment
-Command-Line Options
+
 ------------------------
+Command-Line Options
+
 General Options
 Switch	Description
 -h, --help	Show help and exit
