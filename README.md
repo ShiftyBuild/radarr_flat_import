@@ -57,10 +57,12 @@ Blank lines ignored
 
 Lines starting with # are comments
 ------------------------
-Example:
+File Format Example:
 
 The Matrix (1999)
+
 Alien
+
 Blade Runner (1982)
 
 ------------------------
