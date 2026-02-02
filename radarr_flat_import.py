@@ -7,8 +7,9 @@ Bulk-import movies into Radarr from a flat text file (one movie per line).
 
 Features:
 - Python version check (requires Python 3.8+; avoids 3.10-only type syntax)
+- Prompts for Radarr URL (host) on start (if not already saved) and saves it for reuse
 - Prompts for Radarr API key on start (if not already saved)
-- Saves API key + last Root Folder + last Quality Profile to JSON and prompts to reuse next run
+- Saves Radarr URL + API key + last Root Folder + last Quality Profile to JSON and prompts to reuse next run
 - Pre-flight validation (server + API key)
 - Interactive selection of Root Folder and Quality Profile (queried from Radarr)
 - Prompts to enable Monitored and Search on Add (each run; Search default YES)
@@ -18,14 +19,21 @@ Features:
 - Prompts on issues (MISS / ERR / AMBIG) to continue/abort/always
 - Confirm-before-add prompt (default YES = press Enter) + optional upgrades:
     --auto-add, --yes-all, --max-add
-- Resume support (state file)
+- Resume support (state file stores next_index so resume does not repeat a line)
 - Logging to file
 - Dry-run mode with exportable report of what would have been added
-- Runtime selection of input file (--file)
+- Runtime selection of input file (--file) and Radarr URL (--url)
+- Cleanup/reset switches:
+    --clean, --wipe-config, --nuke, --force (config wipe requires typing WIPE unless --force)
 
 SECURITY NOTE:
 - The API key is stored in plaintext in radarr_flat_import.last_settings.json.
   Protect the file permissions (chmod 600) and rotate your key if needed.
+
+CHANGELOG:
+- 2.4.0 (2026-02-02): Added Radarr URL prompt/persist + --url; added cleanup/reset switches with WIPE safety layer;
+                     resume state stores next_index; skip lookup results missing tmdbId.
+- 2.2.0 (2026-01-29): Initial public version in this repo lineage.
 """
 
 import sys
@@ -42,13 +50,13 @@ from typing import Optional, Dict, Any, List
 # VERSION METADATA
 # =========================
 SCRIPT_NAME = "radarr_flat_import.py"
-SCRIPT_VERSION = "2.2.0"
-SCRIPT_BUILT = "2026-01-29"
+SCRIPT_VERSION = "2.4.0"
+SCRIPT_BUILT = "2026-02-02"
 
 # =========================
 # CONFIG — EDIT THESE
 # =========================
-RADARR_URL = "http://127.0.0.1:7878"
+RADARR_URL = "http://127.0.0.1:7878"  # default; can be overridden by --url or saved settings
 
 # Leave blank; script will prompt and store it.
 API_KEY = ""
@@ -88,6 +96,12 @@ AUTO_ADD = False                 # --auto-add  : disable confirm prompts (bulk m
 YES_ALL = False                  # --yes-all   : after first confirm, stop asking, assume YES
 MAX_ADD = None                   # --max-add N : stop after N successful adds (LIVE mode only)
 
+# Cleanup / reset flags
+CLEAN_RUN_FILES = False          # --clean
+WIPE_CONFIG = False              # --wipe-config
+NUKE_ALL = False                 # --nuke (clean + wipe-config)
+FORCE = False                    # --force (skip confirmation prompts)
+
 # internal state
 always_continue = False          # issue prompts (MISS/ERR/AMBIG), "Always" continues
 always_yes_add = False           # add confirmation, "Always" adds from now on
@@ -98,7 +112,7 @@ QUALITY_PROFILE_ID = None        # type: Optional[int]
 dryrun_hits = []                 # type: List[Dict[str, Any]]
 stats = {
     "processed": 0,
-    "would_add": 0,      # in DRY-RUN: count of would-add; in LIVE: count of adds
+    "would_add": 0,      # in DRY-RUN: count of would-add; in LIVE: kept for backward compat (also incremented)
     "duplicates": 0,
     "misses": 0,
     "errors": 0,
@@ -120,14 +134,22 @@ Options:
   --notes                    Show script docstring and exit
   --dry-run                  Simulate import only (no movies added)
   --file <path>              Input file (default: {DEFAULT_INPUT_FILE})
+  --url <url>                Radarr URL (default: {RADARR_URL})
 
 Add confirmation controls:
   --auto-add                 Disable confirm-before-add prompts (bulk add)
   --yes-all                  After first add confirmation, assume YES for all remaining
   --max-add <N>              Stop after N successful adds (LIVE mode only)
 
+Cleanup / reset:
+  --clean                    Delete files from previous runs (log/state/dryrun report)
+  --wipe-config              Delete saved settings (Radarr URL, API key, last root/profile)
+                             Requires typing WIPE to confirm unless --force is used
+  --nuke                     Equivalent to: --clean --wipe-config
+  --force                    Do not prompt for confirmation (dangerous)
+
 Persistent settings:
-  Remembers API key + last Root Folder + last Quality Profile and prompts to reuse at startup:
+  Remembers Radarr URL + API key + last Root Folder + last Quality Profile and prompts to reuse at startup:
     {LAST_SETTINGS_FILE}
 
 Files created:
@@ -148,7 +170,9 @@ def require_python_version() -> None:
 # ---------- CLI ----------
 
 def handle_cli_flags() -> None:
-    global DRY_RUN, INPUT_FILE, AUTO_ADD, YES_ALL, MAX_ADD
+    global DRY_RUN, INPUT_FILE, AUTO_ADD, YES_ALL, MAX_ADD, RADARR_URL
+    global CLEAN_RUN_FILES, WIPE_CONFIG, NUKE_ALL, FORCE
+
     args = sys.argv[1:]
 
     if "-h" in args or "--help" in args:
@@ -173,6 +197,13 @@ def handle_cli_flags() -> None:
             sys.exit(1)
         INPUT_FILE = args[i + 1]
 
+    if "--url" in args:
+        i = args.index("--url")
+        if i + 1 >= len(args):
+            print("ERROR: --url requires a URL")
+            sys.exit(1)
+        RADARR_URL = args[i + 1].strip().rstrip("/")
+
     if "--auto-add" in args:
         AUTO_ADD = True
 
@@ -191,6 +222,21 @@ def handle_cli_flags() -> None:
         except ValueError:
             print("ERROR: --max-add must be a positive integer")
             sys.exit(1)
+
+    # Cleanup flags
+    if "--clean" in args:
+        CLEAN_RUN_FILES = True
+
+    if "--wipe-config" in args or "--wipe" in args:
+        WIPE_CONFIG = True
+
+    if "--nuke" in args:
+        NUKE_ALL = True
+        CLEAN_RUN_FILES = True
+        WIPE_CONFIG = True
+
+    if "--force" in args:
+        FORCE = True
 
 
 # ---------- Logging ----------
@@ -256,6 +302,12 @@ def prompt_continue(reason: str) -> bool:
             return True
 
 def prompt_confirm_add(title: str, year: Any, tmdb_id: Any) -> bool:
+    """
+    Confirm add per movie.
+    - If AUTO_ADD: always yes
+    - If YES_ALL: first yes flips always_yes_add
+    - User can type 'a' to always add from now on
+    """
     global always_yes_add
 
     if AUTO_ADD:
@@ -263,23 +315,11 @@ def prompt_confirm_add(title: str, year: Any, tmdb_id: Any) -> bool:
     if always_yes_add:
         return True
 
-    # If --yes-all, ask once then set always_yes_add=True on yes
-    if YES_ALL and not always_yes_add:
-        while True:
-            ans = input(f"Add '{title} ({year})' tmdb:{tmdb_id}? [Y/n/a]: ").strip().lower()
-            if ans in ("", "y", "yes"):
-                always_yes_add = True
-                return True
-            if ans in ("n", "no", "s", "skip"):
-                return False
-            if ans in ("a", "all", "always"):
-                always_yes_add = True
-                return True
-
-    # Default: confirm each time (default YES)
     while True:
         ans = input(f"Add '{title} ({year})' tmdb:{tmdb_id}? [Y/n/a]: ").strip().lower()
         if ans in ("", "y", "yes"):
+            if YES_ALL:
+                always_yes_add = True
             return True
         if ans in ("n", "no", "s", "skip"):
             return False
@@ -294,8 +334,41 @@ def prompt_add_behavior() -> None:
     SEARCH_ON_ADD = prompt_yes_no_default("Automatically search when added?", DEFAULT_SEARCH_ON_ADD)
     log(f"Selected add behavior: monitored={MONITORED}, search_on_add={SEARCH_ON_ADD}\n")
 
+def _normalize_url(url: str) -> str:
+    url = (url or "").strip()
+    url = url.rstrip("/")
+    return url
 
-# ---------- Persistent settings (API key + root/profile) ----------
+def prompt_radarr_url(last: Optional[Dict[str, Any]]) -> None:
+    """
+    Prompt for Radarr URL unless already provided by --url.
+    Reuses saved URL if available.
+    """
+    global RADARR_URL
+
+    saved_url = None
+    if last and isinstance(last, dict):
+        saved_url = last.get("radarrUrl") or None
+
+    # If user supplied --url, don't prompt (we trust the CLI override)
+    if "--url" in sys.argv[1:]:
+        RADARR_URL = _normalize_url(RADARR_URL)
+    else:
+        if saved_url:
+            print("\nSaved Radarr URL found:")
+            print(f"  URL: {saved_url}")
+            if prompt_yes_no_default("Reuse saved Radarr URL?", True):
+                RADARR_URL = _normalize_url(str(saved_url))
+            else:
+                RADARR_URL = _normalize_url(input(f"Enter Radarr URL [{RADARR_URL}]: ").strip() or RADARR_URL)
+        else:
+            RADARR_URL = _normalize_url(input(f"Enter Radarr URL [{RADARR_URL}]: ").strip() or RADARR_URL)
+
+    if not RADARR_URL.startswith(("http://", "https://")):
+        fatal("Radarr URL must start with http:// or https://")
+
+
+# ---------- Persistent settings (URL + API key + root/profile) ----------
 
 def load_last_settings() -> Optional[Dict[str, Any]]:
     p = Path(LAST_SETTINGS_FILE)
@@ -365,6 +438,85 @@ def prompt_reuse_root_profile(last: Dict[str, Any]) -> bool:
     return False
 
 
+# ---------- Cleanup / reset ----------
+
+def _safe_unlink(path: str) -> bool:
+    p = Path(path)
+    try:
+        if p.exists():
+            p.unlink()
+            return True
+    except Exception:
+        return False
+    return False
+
+def confirm_wipe_config() -> None:
+    """
+    Extra safety confirmation for destructive config deletion.
+    Requires explicit token unless --force is used.
+    """
+    print("\n" + "=" * 72)
+    print("WARNING: You are about to permanently delete saved configuration.")
+    print("This includes:")
+    print("  - Radarr URL")
+    print("  - API key")
+    print("  - Last Root Folder")
+    print("  - Last Quality Profile")
+    print("=" * 72)
+
+    token = input("Type WIPE to confirm, or anything else to cancel: ").strip()
+    if token != "WIPE":
+        print("Config wipe cancelled.")
+        sys.exit(0)
+
+def cleanup_files() -> None:
+    """
+    Deletes run artifacts and/or saved config depending on flags.
+    Runs early and exits after completion.
+    """
+    targets: List[str] = []
+
+    if CLEAN_RUN_FILES:
+        targets.extend([LOG_FILE, STATE_FILE, DRYRUN_REPORT_FILE])
+
+    if WIPE_CONFIG:
+        targets.append(LAST_SETTINGS_FILE)
+
+    if not targets:
+        return
+
+    # Extra safety: config wipe confirmation token (unless --force)
+    if WIPE_CONFIG and not FORCE:
+        confirm_wipe_config()
+
+    print("\nCleanup requested. The following files may be deleted:")
+    for t in targets:
+        print(f"  - {t}")
+
+    if not FORCE:
+        if not prompt_yes_no_default("Proceed with deletion?", False):
+            print("Cleanup cancelled.")
+            sys.exit(0)
+
+    deleted: List[str] = []
+    skipped: List[str] = []
+    for t in targets:
+        ok = _safe_unlink(t)
+        (deleted if ok else skipped).append(t)
+
+    print("\nCleanup results:")
+    if deleted:
+        print("Deleted:")
+        for d in deleted:
+            print(f"  - {d}")
+    if skipped:
+        print("Not deleted (missing or failed):")
+        for s in skipped:
+            print(f"  - {s}")
+
+    sys.exit(0)
+
+
 # ---------- Dry-run report ----------
 
 def write_dryrun_report() -> None:
@@ -397,20 +549,29 @@ def parse_title_year(term: str):
 # ---------- State / Resume ----------
 
 def load_state() -> Dict[str, Any]:
+    """
+    State stores next_index to process (so resume doesn't repeat a line).
+    Backward-compat: if old 'last_index' exists, treat it as next_index.
+    """
     p = Path(STATE_FILE)
     if not p.exists():
-        return {"last_index": 0}
+        return {"next_index": 0}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, dict):
+            if "next_index" in data:
+                return data
+            # backward compat with older state key
+            if "last_index" in data:
+                return {"next_index": int(data.get("last_index", 0))}
             return data
     except Exception:
         pass
-    return {"last_index": 0}
+    return {"next_index": 0}
 
-def save_state(last_index: int) -> None:
+def save_state(next_index: int) -> None:
     try:
-        Path(STATE_FILE).write_text(json.dumps({"last_index": last_index}, indent=2), encoding="utf-8")
+        Path(STATE_FILE).write_text(json.dumps({"next_index": next_index}, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -576,9 +737,15 @@ def main() -> None:
     require_python_version()
     handle_cli_flags()
 
+    # Cleanup/reset actions (exit after completion)
+    cleanup_files()
+
     last = load_last_settings()
 
-    # API key first
+    # URL first (so preflight and lookups use correct host)
+    prompt_radarr_url(last)
+
+    # API key next
     prompt_api_key(last)
 
     # Now log header with masked key
@@ -593,9 +760,10 @@ def main() -> None:
     # Monitored/Search prompts (each run)
     prompt_add_behavior()
 
-    # Save latest settings (apiKey + root/profile) for next run
+    # Save latest settings (url + apiKey + root/profile) for next run
     to_save = dict(last) if isinstance(last, dict) else {}
     to_save.update({
+        "radarrUrl": RADARR_URL,
         "apiKey": API_KEY,
         "rootFolder": ROOT_FOLDER,
         "qualityProfileId": QUALITY_PROFILE_ID,
@@ -628,7 +796,7 @@ def main() -> None:
 
     # Resume
     state = load_state()
-    start_index = int(state.get("last_index", 0))
+    start_index = int(state.get("next_index", 0))
     if start_index > 0:
         log(f"Resume enabled: starting at line {start_index + 1} of {len(movies)}")
 
@@ -645,7 +813,9 @@ def main() -> None:
     for idx in range(start_index, len(movies)):
         term = movies[idx]
         line_no = idx + 1
-        save_state(idx)
+
+        # Save "next index to process" so resume doesn't repeat the same line
+        save_state(idx + 1)
 
         stats["processed"] += 1
         _, desired_year = parse_title_year(term)
@@ -679,6 +849,14 @@ def main() -> None:
             title = selected.get("title")
             year = selected.get("year", "")
 
+            if not tmdb:
+                stats["errors"] += 1
+                log(f"[{line_no}] [ERR ] {term} -> lookup result missing tmdbId; skipping")
+                if not prompt_continue(f"Lookup result for '{term}' is missing tmdbId."):
+                    fatal("User aborted.")
+                time.sleep(DELAY)
+                continue
+
             if tmdb in existing_tmdb:
                 stats["duplicates"] += 1
                 log(f"[{line_no}] [DUP ] {title} ({year}) tmdb:{tmdb}")
@@ -702,7 +880,7 @@ def main() -> None:
 
             r = add_movie(selected, ROOT_FOLDER, QUALITY_PROFILE_ID)
             if r.status_code in (200, 201):
-                stats["would_add"] += 1
+                stats["would_add"] += 1  # kept for backwards compatibility with your summary wording
                 stats["added"] += 1
                 existing_tmdb.add(tmdb)
                 log(f"[{line_no}] [ADD ] {title} ({year}) tmdb:{tmdb}")
@@ -720,6 +898,7 @@ def main() -> None:
 
         time.sleep(DELAY)
 
+    # Mark completed
     save_state(len(movies))
     write_dryrun_report()
     log(f"Summary: {stats}")
