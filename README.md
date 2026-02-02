@@ -31,7 +31,10 @@ Designed to be **safe**, **resumable**, and **operator-friendly**, even for very
 - Python 3.8+ compatible
 
 ---
+## Download and give execute permissions
+curl -LO https://raw.githubusercontent.com/ShiftyBuild/radarr_flat_import/refs/heads/main/radarr_flat_import.py && chmod +x radarr_flat_import.py
 
+---
 ## Requirements
 
 - Python **3.8+**
