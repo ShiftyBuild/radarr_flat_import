@@ -81,7 +81,8 @@ Switch	Description
 
 Dry Run
 Switch	Description
---dry-run	Simulate import only (no movies added)
+--dry-run  Simulate import only (no movies added)
+
 Creates:
 
 radarr_flat_import.dryrun.txt
