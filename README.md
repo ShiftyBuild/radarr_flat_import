@@ -185,6 +185,7 @@ Rotate API key if compromised
 
 Destructive actions require explicit confirmation unless --force is used
 
+------------------------
 Exit Codes
 Code	Meaning
 0	Success
